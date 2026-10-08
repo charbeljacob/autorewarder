@@ -1,10 +1,8 @@
-cd ~/Desktop/autorewarder
+# Close any running Edge first (Selenium can't share the profile)
+pkill -f microsoft-edge || true
 
-# Connect to your target server first (ExpressVPN CLI already does this)
-expressvpnctl connect "australia-sydney-2"
-
-# Ask the fixed parser what it sees
-.venv/bin/python -c "
-from src.vpn_manager import get_vpn_status
-print(get_vpn_status())
-"
+# Open the profile — replace <id> with the account id
+microsoft-edge \
+    --user-data-dir="$HOME/Desktop/autorewarder/userdata/accounts/<id>/EdgeProfile" \
+    --no-first-run \
+    https://www.bing.com
