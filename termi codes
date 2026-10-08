@@ -1,34 +1,16 @@
-# 1. Install prerequisites
-sudo apt update
-sudo apt install -y wget gpg apt-transport-https
+# 1. Detect the installed Edge version
+EDGE_VERSION=$(microsoft-edge --version | awk '{print $3}')
+echo "Detected Edge version: $EDGE_VERSION"
 
-# 2. Import Microsoft's GPG key
-wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
-sudo install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
-rm packages.microsoft.gpg
+# 2. Download the matching driver from the new domain
+wget -O /tmp/edgedriver.zip "https://msedgedriver.microsoft.com/${EDGE_VERSION}/edgedriver_linux64.zip"
 
-# 3. Add the Edge repository for Debian 13 (Trixie)
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
-
-# 4. Update and install Edge
-sudo apt update
-sudo apt install -y microsoft-edge-stable
-
-# Download and install the matching Edge driver
-EDGE_VERSION=$(microsoft-edge --version | cut -d' ' -f3)
-DRIVER_URL="https://msedgedriver.azureedge.net/${EDGE_VERSION}/edgedriver_linux64.zip"
-wget -O /tmp/edgedriver.zip "$DRIVER_URL"
-
-# Unzip and move the driver to a system-wide location
+# 3. Extract and install the driver
+sudo apt install -y unzip  # Ensure unzip is available
 unzip -o /tmp/edgedriver.zip -d /tmp/msedgedriver/
 sudo mv /tmp/msedgedriver/msedgedriver /usr/local/bin/
 sudo chmod +x /usr/local/bin/msedgedriver
 rm -rf /tmp/edgedriver.zip /tmp/msedgedriver/
 
-from selenium.webdriver.edge.service import Service
-
-# ...
-
-driver = webdriver.Edge(service=Service('/usr/local/bin/msedgedriver'))
-
+# 4. Verify the installation
 msedgedriver --version
