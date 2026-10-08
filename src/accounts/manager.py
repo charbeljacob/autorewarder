@@ -36,28 +36,22 @@ class AccountManager:
     Account index schema (accounts.json):
         [{"id": "<hex12>", "label": "Default", "created_at": "<ISO>"}]
 
-    Per-account first_setup_done lives in meta.json (via AccountMetaManager).
+    Per-account first_setup_done, schedule, VPN config, and dashboard variant
+    live in meta.json (via AccountMetaManager).
     """
 
     def __init__(self, global_settings, logger=None):
-        """
-        Args:
-            global_settings: an instance of GlobalSettingsManager for current account tracking.
-            logger: optional callable for logging messages.
-        """
         self._global = global_settings
         self._logger = logger
         os.makedirs(ACCOUNTS_DIR, exist_ok=True)
 
     def _log(self, msg):
-        """Send a log message if a logger is configured."""
         if self._logger:
             self._logger(msg)
 
     # ---- Index I/O ----------------------------------------------------
 
     def _read_index(self):
-        """Load the accounts index list from disk."""
         if not os.path.exists(ACCOUNTS_INDEX_PATH):
             return []
         try:
@@ -68,128 +62,132 @@ class AccountManager:
             return []
 
     def _write_index(self, accounts):
-        """Persist the accounts index list to disk atomically."""
         os.makedirs(APP_DIR, exist_ok=True)
         tmp = ACCOUNTS_INDEX_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(accounts, f, indent=4)
         os.replace(tmp, ACCOUNTS_INDEX_PATH)
 
+    # ---- Meta summary helper -----------------------------------------
+
+    # ── NEW ────────────────────────────────────────────────────────────
+    def _read_meta_summary(self, account_id):
+        """
+        Read the per-account meta.json once and return the fields the
+        account list needs:
+            {"first_setup_done": bool,
+             "vpn_server": Optional[str],
+             "geo_locale": Optional[str]}
+        """
+        summary = {
+            "first_setup_done": False,
+            "vpn_server": None,
+            "geo_locale": None,
+        }
+        meta_path = account_meta_path(account_id)
+        if not os.path.exists(meta_path):
+            return summary
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return summary
+        if not isinstance(data, dict):
+            return summary
+
+        summary["first_setup_done"] = bool(data.get("first_setup_done"))
+
+        vpn = data.get("vpn")
+        if isinstance(vpn, dict):
+            server = vpn.get("server")
+            geo = vpn.get("geo_locale")
+            if isinstance(server, str) and server.strip():
+                summary["vpn_server"] = server.strip()
+            if isinstance(geo, str) and geo.strip():
+                summary["geo_locale"] = geo.strip().upper()
+
+        return summary
+    # ───────────────────────────────────────────────────────────────────
+
     # ---- Queries ------------------------------------------------------
 
     def list(self):
         """Return account entries with UI-ready metadata."""
         current = self.current_id()
-        accounts = self._read_index()
         result = []
-        for acc in accounts:
+        for acc in self._read_index():
             aid = acc.get("id")
             if not aid:
                 continue
-            result.append(
-                {
-                    "id": aid,
-                    "label": acc.get("label") or "Account",
-                    "first_setup_done": self._is_first_setup_done(aid),
-                    "is_current": aid == current,
-                    "created_at": acc.get("created_at"),
-                }
-            )
+            meta = self._read_meta_summary(aid)
+            result.append({
+                "id": aid,
+                "label": acc.get("label") or "Account",
+                "first_setup_done": meta["first_setup_done"],
+                "is_current": aid == current,
+                "created_at": acc.get("created_at"),
+                # NEW:
+                "vpn_server": meta["vpn_server"],
+                "geo_locale": meta["geo_locale"],
+            })
         return result
 
     def get(self, account_id):
         """Return metadata for a specific account id, or None."""
         for acc in self._read_index():
             if acc.get("id") == account_id:
+                meta = self._read_meta_summary(account_id)
                 return {
                     "id": account_id,
                     "label": acc.get("label") or "Account",
-                    "first_setup_done": self._is_first_setup_done(account_id),
+                    "first_setup_done": meta["first_setup_done"],
                     "is_current": account_id == self.current_id(),
                     "created_at": acc.get("created_at"),
+                    # NEW:
+                    "vpn_server": meta["vpn_server"],
+                    "geo_locale": meta["geo_locale"],
                 }
         return None
 
     def current_id(self):
-        """Return the currently selected account id, or None."""
         return self._global.get_current_account_id()
 
     def get_current(self):
-        """Return the currently selected account entry, or None."""
         aid = self.current_id()
         return self.get(aid) if aid else None
 
     def exists(self, account_id):
-        """Return True if the account id exists in the index."""
         return any(acc.get("id") == account_id for acc in self._read_index())
 
     def _is_first_setup_done(self, account_id):
-        """
-        Check whether the account meta marks first setup done.
-        """
-        meta_path = account_meta_path(account_id)
-        if not os.path.exists(meta_path):
-            return False
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return bool(isinstance(data, dict) and data.get("first_setup_done"))
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return False
+        return self._read_meta_summary(account_id)["first_setup_done"]
 
     # ---- Mutations ----------------------------------------------------
 
     def create(self, label):
-        """
-        Create a new account directory and index entry. Does NOT select it.
-
-        Args:
-            label (str): The label for the new account.
-
-        Returns:
-            dict: A dictionary containing the new account's ID and label.
-        """
         label = (label or "").strip() or "Account"
         aid = _new_account_id()
-        # Vanishingly unlikely collision, but defensive.
         while self.exists(aid):
             aid = _new_account_id()
 
         os.makedirs(account_dir(aid), exist_ok=True)
 
         accounts = self._read_index()
-        accounts.append(
-            {
-                "id": aid,
-                "label": label,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
+        accounts.append({
+            "id": aid,
+            "label": label,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
         self._write_index(accounts)
         self._log(f"Created account '{label}' ({aid})")
         return {"id": aid, "label": label, "first_setup_done": False}
 
     def select(self, account_id):
-        """
-        Set the current account id in global settings.
-
-        Raises:
-            ValueError: If the account_id is not found in the index.
-        """
         if account_id is not None and not self.exists(account_id):
             raise ValueError(f"Account not found: {account_id}")
         self._global.set_current_account_id(account_id)
 
     def rename(self, account_id, new_label):
-        """
-        Rename an account label in the index.
-
-        Args:
-            account_id (str): The ID of the account to rename.
-            new_label (str): The new label for the account.
-        Raises:
-            ValueError: If the account is not found or the new label is empty.
-        """
         new_label = (new_label or "").strip()
         if not new_label:
             raise ValueError("Label must not be empty")
@@ -206,11 +204,6 @@ class AccountManager:
         self._log(f"Renamed account {account_id} to '{new_label}'")
 
     def delete(self, account_id):
-        """
-        Remove the account directory and index entry.
-
-        Returns the next account_id that should become current (first remaining) or None.
-        """
         if not self.exists(account_id):
             raise ValueError(f"Account not found: {account_id}")
 
@@ -235,26 +228,16 @@ class AccountManager:
     # ---- Migration ----------------------------------------------------
 
     def migrate_legacy(self):
-        """
-        One-shot migration: if no accounts.json exists and the old single-profile
-        files are present at APP_DIR root, move them into a new 'Default' account.
-
-        Returns the new account id (if migration occurred), or None.
-        """
         if os.path.exists(ACCOUNTS_INDEX_PATH):
             return None
 
         has_legacy = any(
             os.path.exists(p)
-            for p in (
-                LEGACY_EDGE_PROFILE_PATH,
-                LEGACY_HISTORY_FILE_PATH,
-                LEGACY_STATUS_FILE_PATH,
-            )
+            for p in (LEGACY_EDGE_PROFILE_PATH, LEGACY_HISTORY_FILE_PATH,
+                      LEGACY_STATUS_FILE_PATH)
         )
 
         if not has_legacy:
-            # Fresh install: create an empty index and stop.
             self._write_index([])
             return None
 
@@ -265,19 +248,12 @@ class AccountManager:
             os.makedirs(target, exist_ok=True)
 
             if os.path.exists(LEGACY_EDGE_PROFILE_PATH):
-                shutil.move(
-                    LEGACY_EDGE_PROFILE_PATH, os.path.join(target, "EdgeProfile")
-                )
+                shutil.move(LEGACY_EDGE_PROFILE_PATH, os.path.join(target, "EdgeProfile"))
             if os.path.exists(LEGACY_HISTORY_FILE_PATH):
-                shutil.move(
-                    LEGACY_HISTORY_FILE_PATH, os.path.join(target, "history.json")
-                )
+                shutil.move(LEGACY_HISTORY_FILE_PATH, os.path.join(target, "history.json"))
             if os.path.exists(LEGACY_STATUS_FILE_PATH):
-                shutil.move(
-                    LEGACY_STATUS_FILE_PATH, os.path.join(target, "status.json")
-                )
+                shutil.move(LEGACY_STATUS_FILE_PATH, os.path.join(target, "status.json"))
 
-            # Lift legacy "first_setup_done" into the new per-account meta.json.
             legacy_settings_path = os.path.join(APP_DIR, "settings.json")
             legacy_first_setup_done = False
             legacy_settings = None
@@ -292,13 +268,10 @@ class AccountManager:
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                     legacy_settings = None
 
-            # Write per-account meta.json.
             meta_path = account_meta_path(aid)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump({"first_setup_done": legacy_first_setup_done}, f, indent=4)
 
-            # Strip the legacy key from global settings and persist
-            # (preserve hide_browser which still lives at the global layer).
             if isinstance(legacy_settings, dict):
                 hide_browser = bool(legacy_settings.get("hide_browser", False))
                 self._global.set_hide_browser(hide_browser)
@@ -306,15 +279,11 @@ class AccountManager:
                 stripped.pop("first_setup_done", None)
                 self._global.save_settings(stripped)
 
-            self._write_index(
-                [
-                    {
-                        "id": aid,
-                        "label": "Default",
-                        "created_at": datetime.now().isoformat(timespec="seconds"),
-                    }
-                ]
-            )
+            self._write_index([{
+                "id": aid,
+                "label": "Default",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }])
             self._global.set_current_account_id(aid)
 
             self._log("Migrated legacy single-account files into 'Default' account.")
@@ -322,11 +291,9 @@ class AccountManager:
 
         except OSError as e:
             self._log(f"[ERROR] Legacy migration failed: {e}")
-            # Best-effort rollback: remove the partially-created account dir.
             try:
                 if os.path.exists(target):
                     shutil.rmtree(target)
             except OSError:
                 pass
-            # Do not write accounts.json on failure so migration can retry next launch.
             return None

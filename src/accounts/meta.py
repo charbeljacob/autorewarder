@@ -1,4 +1,4 @@
-"""Per-account metadata persistence (first_setup_done, schedule)."""
+"""Per-account metadata persistence (first_setup_done, schedule, VPN)."""
 
 import json
 import os
@@ -6,28 +6,30 @@ import os
 from ..config import account_dir, account_meta_path
 
 DEFAULT_ACCOUNT_SCHEDULE = {
-    # Master toggle for this account's scheduled headless run.
     "enabled": False,
-    # False = single burst when the headless runner fires.
-    # True  = drip-feed the total across runDuration at queriesPerHour.
     "advancedScheduling": False,
-    "runDuration": 3,  # hours, 1..24
-    "queriesPerHour": 10,  # 1..99
-    "queries_pc": 30,  # 0..130
-    "queries_mobile": 20,  # 0..99
+    "runDuration": 3,
+    "queriesPerHour": 10,
+    "queries_pc": 30,
+    "queries_mobile": 20,
     "last_triggered_date": None,
-    # Wall-clock time at which the OS-level scheduled task fires for this
-    # account (24h "HH:MM"). Each account gets its own scheduled task so
-    # users can stagger runs (e.g. Alice 09:00, Bob 10:30).
     "run_time": "09:00",
 }
 
-# Which Microsoft Rewards dashboard this account uses. Microsoft is rolling out
-# a new React/Next.js dashboard that has a completely different DOM from the
-# legacy `mee-rewards-*` one; the Daily Set automation must branch on it.
-#   "auto"   -> detect at runtime which dashboard rendered (default)
-#   "legacy" -> force the historical mee-rewards-* dashboard
-#   "new"    -> force the new Next.js dashboard
+# ── NEW: per-account VPN configuration ──────────────────────────────────
+# Stored under meta["vpn"] in the account's meta.json.
+#   server     — ExpressVPN alias, e.g. "usa-new-jersey-1".
+#                Leave unset to skip VPN handling entirely.
+#                Sentinels "disconnect"/"none"/"local"/"off" force VPN off.
+#   geo_locale — ISO-3166 alpha-2 code expected from the exit IP
+#                ("US", "GB", "PH"). When set, the exit IP is verified
+#                and the system timezone synced to the VPN's country.
+DEFAULT_ACCOUNT_VPN = {
+    "server": None,
+    "geo_locale": None,
+}
+# ────────────────────────────────────────────────────────────────────────
+
 DASHBOARD_VARIANTS = ("auto", "legacy", "new")
 DEFAULT_DASHBOARD_VARIANT = "auto"
 
@@ -37,15 +39,18 @@ def default_account_schedule():
     return dict(DEFAULT_ACCOUNT_SCHEDULE)
 
 
+def default_account_vpn():
+    """Return a fresh copy of the default per-account VPN config."""
+    return dict(DEFAULT_ACCOUNT_VPN)
+
+
 def _read_json(path, default):
-    """Read a JSON file. On any parse/IO failure, back it up as .backup and return default."""
+    """Read a JSON file. On any parse/IO failure, back it up and return default."""
     if not os.path.exists(path):
         return default
-
     try:
         with open(path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            return data
+            return json.load(file)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError):
         backup_path = path + ".backup"
         if os.path.exists(backup_path):
@@ -61,19 +66,7 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    """
-    Atomically write JSON via a temp file rename, with a retry loop that
-    tolerates transient Windows locks (Defender, indexer, another instance
-    briefly holding the file). A stale `.tmp` from a previous crashed write
-    is removed before the write so its file attributes don't block us.
-
-    Args:
-        path: target file path to write
-        data: JSON-serializable data to write
-
-    Raises:
-        OSError: If the file cannot be written.
-    """
+    """Atomically write JSON via a temp file rename, retrying transient Windows locks."""
     import time as _time
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -103,15 +96,11 @@ def _write_json(path, data):
 
 class AccountMetaManager:
     """
-    Per-account metadata (currently just first_setup_done).
+    Per-account metadata (first_setup_done, schedule, VPN, dashboard variant).
     Stored at accounts/<account_id>/meta.json.
     """
 
     def __init__(self, account_id):
-        """
-        Args:
-            account_id: the ID of the account this manager handles (string)
-        """
         self.account_id = account_id
         self.path = account_meta_path(account_id)
 
@@ -147,17 +136,14 @@ class AccountMetaManager:
         _write_json(self.path, meta)
 
     def is_first_setup_done(self):
-        """Return True if first setup is marked complete."""
         return bool(self.get_meta().get("first_setup_done"))
 
     def mark_up_as_done(self):
-        """Mark first setup as completed."""
         meta = self.get_meta()
         meta["first_setup_done"] = True
         self.save_meta(meta)
 
     def get_schedule(self):
-        """Return this account's schedule, with defaults for missing keys."""
         meta = self.get_meta()
         sched = meta.get("schedule") if isinstance(meta, dict) else None
         merged = default_account_schedule()
@@ -166,41 +152,58 @@ class AccountMetaManager:
         return merged
 
     def set_schedule(self, sched):
-        """
-        Persist this account's schedule. `sched` should be a dict.
-
-        Args:
-            sched: dict with keys matching default_account_schedule.
-                Missing keys will fall back to default values.
-                Example: {"enabled": True, "queriesPerHour": 15}
-        """
         meta = self.get_meta()
         meta["schedule"] = sched
         self.save_meta(meta)
 
-    def get_dashboard_variant(self):
-        """
-        Return this account's Rewards dashboard variant.
+    # ── NEW: per-account VPN ───────────────────────────────────────────
 
-        Returns one of DASHBOARD_VARIANTS, defaulting to DEFAULT_DASHBOARD_VARIANT
-        when unset or invalid (backward compatible: pre-existing meta.json files
-        simply resolve to "auto").
+    def get_vpn_config(self):
         """
+        Return this account's VPN config with defaults for missing keys:
+            {"server": Optional[str], "geo_locale": Optional[str]}
+        """
+        meta = self.get_meta()
+        vpn = meta.get("vpn") if isinstance(meta, dict) else None
+        merged = default_account_vpn()
+        if isinstance(vpn, dict):
+            merged.update({k: vpn.get(k, v) for k, v in merged.items()})
+        return merged
+
+    def set_vpn_config(self, vpn):
+        """Persist this account's VPN config (missing keys default to None)."""
+        merged = default_account_vpn()
+        if isinstance(vpn, dict):
+            merged.update({k: vpn.get(k, v) for k, v in merged.items()})
+        meta = self.get_meta()
+        meta["vpn"] = merged
+        self.save_meta(meta)
+
+    def get_vpn_server(self):
+        return self.get_vpn_config().get("server")
+
+    def set_vpn_server(self, server):
+        cfg = self.get_vpn_config()
+        cfg["server"] = server
+        self.set_vpn_config(cfg)
+
+    def get_geo_locale(self):
+        return self.get_vpn_config().get("geo_locale")
+
+    def set_geo_locale(self, geo_locale):
+        cfg = self.get_vpn_config()
+        cfg["geo_locale"] = geo_locale
+        self.set_vpn_config(cfg)
+
+    # ───────────────────────────────────────────────────────────────────
+
+    def get_dashboard_variant(self):
         variant = self.get_meta().get("dashboard_variant")
         if variant in DASHBOARD_VARIANTS:
             return variant
         return DEFAULT_DASHBOARD_VARIANT
 
     def set_dashboard_variant(self, variant):
-        """
-        Persist this account's Rewards dashboard variant.
-
-        Args:
-            variant: one of DASHBOARD_VARIANTS ("auto", "legacy", "new").
-
-        Returns:
-            bool: True if persisted, False if the value was rejected.
-        """
         if variant not in DASHBOARD_VARIANTS:
             return False
         meta = self.get_meta()
