@@ -46,6 +46,18 @@ from .stats import (
     POINTS_PER_CARD,
 )
 
+# ── NEW: per-account VPN ────────────────────────────────────────────────
+# `src/vpn_manager.py` is pure stdlib + urllib, so importing it here has
+# no runtime cost beyond what the file itself defines. All the heavy
+# lifting (ExpressVPN CLI, IP lookup, timezone sync) happens lazily
+# inside ensure_vpn_for_account().
+from .vpn_manager import (
+    ensure_vpn_for_account,
+    USE_SINGLE_VPN_FOR_ALL,
+    SINGLE_VPN_SERVER,
+)
+# ────────────────────────────────────────────────────────────────────────
+
 # Default wall-clock fire time (24h "HH:MM") if an account schedule does
 # not yet have a `run_time` value. Each account stores its own time in
 # meta.json; this constant is only the fallback default for fresh accounts.
@@ -688,8 +700,9 @@ class AutoRewarderAPI:
             return None
         return AccountMetaManager(account_id).get_schedule()
 
+    # ── CHANGED: include per-account VPN config in the summary ──────────
     def get_all_schedules(self):
-        """Return [{id, label, first_setup_done, schedule, dashboard_variant}] for the settings modal."""
+        """Return [{id, label, first_setup_done, schedule, dashboard_variant, vpn}]."""
         result = []
         for acc in self.account_manager.list():
             meta = AccountMetaManager(acc["id"])
@@ -700,9 +713,11 @@ class AutoRewarderAPI:
                     "first_setup_done": acc["first_setup_done"],
                     "schedule": meta.get_schedule(),
                     "dashboard_variant": meta.get_dashboard_variant(),
+                    "vpn": meta.get_vpn_config(),
                 }
             )
         return result
+    # ────────────────────────────────────────────────────────────────────
 
     def get_dashboard_variant(self, account_id):
         """Return a specific account's Rewards dashboard variant, or None if unknown."""
@@ -731,6 +746,68 @@ class AutoRewarderAPI:
         if account_id == self.account_manager.current_id() and self.daily_set:
             self.daily_set.dashboard_variant = variant
         return True
+
+    # ── NEW: per-account VPN config (exposed to JS) ────────────────────
+
+    def get_vpn_config(self, account_id):
+        """
+        Return {server, geo_locale} for an account, or None if unknown.
+
+        Args:
+            account_id (str): the account to read.
+
+        Returns:
+            dict | None: {"server": str|None, "geo_locale": str|None}
+        """
+        if not account_id or not self.account_manager.exists(account_id):
+            return None
+        return AccountMetaManager(account_id).get_vpn_config()
+
+    def set_vpn_config(self, account_id, payload):
+        """
+        Persist a per-account VPN config.
+
+        Args:
+            account_id (str): the account to update.
+            payload (dict): {"server": str|None, "geo_locale": str|None}.
+                Unknown keys ignored. `None`/"" clears that field. The
+                geo_locale value is uppercased for consistency (ISO-3166
+                alpha-2).
+
+        Returns:
+            bool: True on success, False if the account is unknown or the
+                payload isn't a dict.
+        """
+        if not account_id or not self.account_manager.exists(account_id):
+            return False
+        if not isinstance(payload, dict):
+            return False
+
+        def _clean(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                v = value.strip()
+                return v or None
+            return value
+
+        new_cfg = {
+            "server": _clean(payload.get("server")),
+            "geo_locale": _clean(payload.get("geo_locale")),
+        }
+        if new_cfg["geo_locale"]:
+            new_cfg["geo_locale"] = new_cfg["geo_locale"].upper()
+
+        AccountMetaManager(account_id).set_vpn_config(new_cfg)
+        acc = self.account_manager.get(account_id)
+        label = acc["label"] if acc else account_id
+        self.log(
+            f"[VPN] Config saved for '{label}': "
+            f"server={new_cfg['server']!r}, geo_locale={new_cfg['geo_locale']!r}"
+        )
+        return True
+
+    # ────────────────────────────────────────────────────────────────────
 
     def set_schedule(self, account_id, payload):
         """
@@ -2139,6 +2216,59 @@ class AutoRewarderAPI:
                 pass
 
     # ------------------------------------------------------------------
+    # NEW: per-account VPN — applied before each run
+    # ------------------------------------------------------------------
+
+    def _apply_vpn_for_current_account(self):
+        """
+        Ensure the currently-selected account's VPN is active before its run.
+
+        Returns:
+            (ok: bool, reason: Optional[str])
+
+        Behavior:
+          * No `vpn.server` set in meta.json AND USE_SINGLE_VPN_FOR_ALL is
+            False → return (True, None) with no VPN work done. Existing
+            installs (no vpn block in meta.json) are unaffected.
+          * Otherwise → delegate to src.vpn_manager.ensure_vpn_for_account,
+            which handles the sentinel values ("disconnect", "none", "local",
+            "off"), the local-IP verification path, the ipinfo.io + ip.sb
+            cross-check, and the system timezone sync.
+
+        The function is also safe to call repeatedly (advanced scheduling
+        batches, account switches) — vpn_manager short-circuits when the
+        correct server is already connected.
+        """
+        account_id = self.account_manager.current_id()
+        if not account_id:
+            return True, None
+
+        meta = AccountMetaManager(account_id)
+        vpn_cfg = meta.get_vpn_config()
+        server = vpn_cfg.get("server")
+
+        if not server and not USE_SINGLE_VPN_FOR_ALL:
+            # Nothing configured → skip entirely. This is the common case
+            # for existing users who haven't added a vpn block yet.
+            return True, None
+
+        current = self.account_manager.get_current()
+        label = current["label"] if current else account_id
+
+        account_view = {
+            "email": label,
+            "vpn_server": server or SINGLE_VPN_SERVER,
+            "geo_locale": vpn_cfg.get("geo_locale"),
+        }
+
+        self.log(
+            f"[VPN] Applying VPN for '{label}': "
+            f"server={account_view['vpn_server']!r}, "
+            f"geo_locale={account_view['geo_locale']!r}"
+        )
+        return ensure_vpn_for_account(account_view)
+
+    # ------------------------------------------------------------------
     # Main run
     # ------------------------------------------------------------------
 
@@ -2261,6 +2391,7 @@ class AutoRewarderAPI:
         if not self._stop_event.is_set() and pc_left <= 0 and mobile_left <= 0:
             self.log("Advanced schedule completed!")
 
+    # ── CHANGED: main() now applies VPN and returns bool ────────────────
     def main(self, pc_count, mobile_count=0, daily_only=False):
         """
         Run the bot against the currently-selected account.
@@ -2272,25 +2403,33 @@ class AutoRewarderAPI:
 
         Daily-only mode (daily_only=True): skips searches entirely and only
         opens a desktop driver to run the Daily Set + More Activities. Both
-        count arguments are ignored. Useful when the user just wants to
-        collect today's daily-task points without churning searches.
+        count arguments are ignored.
+
+        Per-account VPN is applied here, before any browser work, so both
+        the GUI Start button and the headless runner (which both call this
+        method) get identical VPN behavior. On VPN failure the run is
+        skipped without consuming the account's daily trigger.
 
         Args:
             pc_count (int): how many searches to do in the PC phase (ignored if daily_only)
             mobile_count (int): how many searches to do in the Mobile phase (ignored if daily_only)
             daily_only (bool): whether to skip searches and just run the Daily Set
+
+        Returns:
+            bool: True if the run executed, False if it was skipped — no
+                account, no first-setup, nothing-to-do, or VPN setup failed.
         """
         if self.account_manager.current_id() is None:
             self.log("[ERROR] No account selected. Add one via the dropdown.")
             if self._webview_window:
                 self._webview_window.evaluate_js("enable_start_button()")
-            return
+            return False
 
         if self.account_meta is None or not self.account_meta.is_first_setup_done():
             self.log("[ERROR] First Setup has not been completed for this account.")
             if self._webview_window:
                 self._webview_window.evaluate_js("enable_start_button()")
-            return
+            return False
 
         daily_only = bool(daily_only)
 
@@ -2304,7 +2443,19 @@ class AutoRewarderAPI:
             self.log("[WARNING] Nothing to do (PC and Mobile counts are both 0).")
             if self._webview_window:
                 self._webview_window.evaluate_js("enable_start_button()")
-            return
+            return False
+
+        # ── NEW: per-account VPN setup ─────────────────────────────────
+        # Applied before any browser work so a VPN failure is a clean skip
+        # (no driver opened, no daily trigger consumed). Existing installs
+        # that don't have a `vpn` block in meta.json are no-ops here.
+        vpn_ok, vpn_reason = self._apply_vpn_for_current_account()
+        if not vpn_ok:
+            self.log(f"[VPN] ✗ Skipping run — {vpn_reason}")
+            if self._webview_window:
+                self._webview_window.evaluate_js("enable_start_button()")
+            return False
+        # ───────────────────────────────────────────────────────────────
 
         schedule = {}
         if not daily_only and self.account_meta is not None:
@@ -2332,7 +2483,7 @@ class AutoRewarderAPI:
 
         if not self._run_lock.acquire(blocking=False):
             self.log("[WARNING] A run is already in progress.")
-            return
+            return False
 
         # Reset stop flag before each run so a previous Stop doesn't carry over.
         self._stop_event.clear()
@@ -2407,6 +2558,9 @@ class AutoRewarderAPI:
             except Exception:
                 pass
             self._run_lock.release()
+
+        return True
+    # ────────────────────────────────────────────────────────────────────
 
     def _try_scrape_balance(self):
         """
