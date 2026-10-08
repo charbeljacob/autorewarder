@@ -148,7 +148,7 @@ def get_vpn_status() -> dict:
     """
     Return {'connected': bool, 'location': Optional[str]}.
 
-    Newer versions of the ExpressVPN Linux app print extra info after the
+    Newer ExpressVPN Linux clients print extra info after the
     "Connected to <server>" line, e.g.:
 
         Connected to australia-sydney-2
@@ -156,20 +156,20 @@ def get_vpn_status() -> dict:
         network lock: enabled when connected
         split tunnel: disabled
 
-    We only want the server name from the first line. The old
-    `rsplit("connected to")` approach swallowed all the extra lines, which
-    caused `is_same_server()` to always fail and the account to be skipped.
+    We only want the server name from the first line, matched
+    case-insensitively (ExpressVPN uses "Connected to" with a capital C).
     """
     out = vpn_cli("status")
     if not out:
         return {"connected": False, "location": None}
 
+    marker = "connected to"
     for raw_line in out.splitlines():
         line = raw_line.strip()
         low = line.lower()
-        if "connected to" in low:
-            # Take the substring after the marker on this single line only.
-            server = line.split("connected to", 1)[1].strip()
+        idx = low.find(marker)
+        if idx != -1:
+            server = line[idx + len(marker):].strip()
             if server:
                 return {"connected": True, "location": server}
 
