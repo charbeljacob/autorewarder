@@ -1,21 +1,12 @@
 """
 AutoRewarder headless / scheduled runner (multi-account aware).
 
-Launched automatically by the OS autostart entry (written by the Settings
-toggle "Start with Windows/Linux"): both on Windows (HKCU Run) and Linux
-(~/.config/autostart/AutoRewarder.desktop). Reads each account's schedule
-from its meta.json and drives `AutoRewarderAPI.main(pc_count, mobile_count)`
-without bringing up the pywebview GUI.
+…
 
-Usage examples:
-    # Fire every enabled schedule sequentially (this is what autostart does):
-    python AutoRewarder.py --headless
-
-    # Target a single account by id or label:
-    python AutoRewarder.py --headless --account <id-or-label>
-
-    # Override PC / Mobile counts on the fly (only with --account):
-    python AutoRewarder.py --headless --account Alice --pc 10 --mobile 5
+VPN note: per-account VPN setup is applied inside `AutoRewarderAPI.main()`
+(the same funnel the GUI Start button uses), not here. `_run_scheduled`
+merely checks `main()`'s bool return value to bail out of its batch loop
+when a batch was skipped — e.g. because VPN setup for this account failed.
 """
 
 import argparse
@@ -30,33 +21,21 @@ from src.api import AutoRewarderAPI
 from src.accounts import AccountMetaManager
 from src.config import LOG_FILE_PATH, LOG_MAX_SIZE
 
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
-
 def _iso_now():
-    """
-    Return current time as an ISO string with seconds precision.
-    Example: "2024-06-01T14:23:45"
-    """
     return datetime.now().isoformat(timespec="seconds")
 
 
 def console_log(message):
-    """
-    Print to stdout and append to the rotating background log file.
-
-    Args:
-        message (str): The message to log.
-    """
     line = f"[{_iso_now()}] {message}"
     print(line)
     try:
-        if (
-            os.path.exists(LOG_FILE_PATH)
-            and os.path.getsize(LOG_FILE_PATH) >= LOG_MAX_SIZE
-        ):
+        if (os.path.exists(LOG_FILE_PATH)
+                and os.path.getsize(LOG_FILE_PATH) >= LOG_MAX_SIZE):
             try:
                 os.remove(LOG_FILE_PATH)
             except OSError:
@@ -71,39 +50,20 @@ def console_log(message):
 # Run helpers
 # ---------------------------------------------------------------------------
 
-
 def _run_once(api, pc, mobile):
-    """
-    Single burst: PC then Mobile, all in one go.
-
-    Args:
-        api: AutoRewarderAPI instance (must already be headless-configured)
-        pc: number of PC queries to run
-        mobile: number of Mobile queries to run
-    """
+    """Single burst: PC then Mobile, in one go."""
     console_log(f"Single run: PC={pc}, Mobile={mobile}")
     try:
-        api.main(int(pc), int(mobile))
+        ok = api.main(int(pc), int(mobile))
+        if ok is False:
+            console_log("[WARNING] api.main() reported the run was skipped "
+                        "(e.g. VPN failure).")
     except Exception as e:
         console_log(f"[ERROR] Run failed: {e}")
 
 
 def _run_scheduled(api, pc, mobile, duration_hours, queries_per_hour):
-    """
-    Drip-feed `pc + mobile` queries across `duration_hours` at ~queries_per_hour.
-
-    Runs PC batches first, then Mobile batches (the Daily Set check piggybacks
-    on the PC phase inside api.main via its run_phase logic). The schedule
-    repeats very small batches (≤ 10 queries) with jittered sleeps so the
-    pattern doesn't look scripted.
-
-    Args:
-        api: AutoRewarderAPI instance (must already be headless-configured)
-        pc: total PC queries to run
-        mobile: total Mobile queries to run
-        duration_hours: how many hours to spread the queries across
-        queries_per_hour: target queries per hour (overrides duration_hours if > 0)
-    """
+    """Drip-feed `pc + mobile` queries across `duration_hours`."""
     pc = int(pc)
     mobile = int(mobile)
     total = pc + mobile
@@ -118,9 +78,8 @@ def _run_scheduled(api, pc, mobile, duration_hours, queries_per_hour):
         console_log("Nothing scheduled (PC + Mobile = 0).")
         return
 
-    # Batch sizing heuristic identical to v3.1 main's runner.
     if qph > 0:
-        raw_batch = qph // 6  # ~10-minute batches
+        raw_batch = qph // 6
     else:
         raw_batch = total // max(1, int(duration_hours * 2))
     per_batch = max(1, min(10, raw_batch))
@@ -137,7 +96,6 @@ def _run_scheduled(api, pc, mobile, duration_hours, queries_per_hour):
     mobile_left = mobile
 
     for i in range(num_batches):
-        # Take from PC first until exhausted, then switch to Mobile.
         if pc_left > 0:
             batch_pc = min(per_batch, pc_left)
             batch_mobile = 0
@@ -152,10 +110,24 @@ def _run_scheduled(api, pc, mobile, duration_hours, queries_per_hour):
             f"Batch {i+1}/{num_batches}: PC={batch_pc}, Mobile={batch_mobile} "
             f"(PC left {pc_left}, Mobile left {mobile_left})"
         )
+
+        # ── NEW: respect api.main()'s return value ────────────────────
+        # A False return means the batch was skipped entirely (e.g. VPN
+        # setup failed for this account). Nothing was consumed, and the
+        # condition won't resolve itself mid-loop, so abort the schedule.
         try:
-            api.main(batch_pc, batch_mobile)
+            ok = api.main(batch_pc, batch_mobile)
         except Exception as e:
             console_log(f"[ERROR] Batch {i+1} failed: {e}")
+            ok = True  # treat unexpected errors as "continue" (existing behavior)
+
+        if ok is False:
+            console_log(
+                f"Batch {i+1} was skipped (see above) — aborting this schedule "
+                f"for this account."
+            )
+            return
+        # ──────────────────────────────────────────────────────────────
 
         pc_left -= batch_pc
         mobile_left -= batch_mobile
@@ -174,27 +146,15 @@ def _run_scheduled(api, pc, mobile, duration_hours, queries_per_hour):
 # API bootstrap
 # ---------------------------------------------------------------------------
 
-
 def _create_headless_api():
-    """
-    Build an AutoRewarderAPI bound to the console logger and force hide_browser.
-
-    Returns:
-        AutoRewarderAPI: a ready-to-run API instance with no GUI
-    """
     api = AutoRewarderAPI()
-    # Replace the GUI-bound logger with our console one.
     api.log = console_log
     api._safe_log = console_log
 
-    # Force headless at runtime only — do NOT call api.set_hide_browser(True),
-    # which persists to settings.json and would silently flip the user's GUI
-    # preference every time a scheduled run fires.
     api.hide_browser = True
     if api.driver_manager is not None:
         api.driver_manager.hide_browser = True
 
-    # Rebind the logger on per-account managers that captured it early.
     if api.history is not None:
         api.history._logger = console_log
     if api.daily_set is not None:
@@ -208,16 +168,6 @@ def _create_headless_api():
 
 
 def _resolve_account(api, token):
-    """
-    Resolve an --account argument (id or label) to an account entry, or None.
-
-    Args:
-        api: AutoRewarderAPI instance (must already be headless-configured)
-        token: the --account argument to resolve
-
-    Returns:
-        dict: the matching account entry, or None if no match
-    """
     if not token:
         return None
     for acc in api.account_manager.list():
@@ -227,12 +177,6 @@ def _resolve_account(api, token):
 
 
 def _mark_triggered_today(account_id):
-    """
-    Set `last_triggered_date` on the account's schedule to today.
-
-    Args:
-        account_id: the id of the account to mark
-    """
     meta = AccountMetaManager(account_id)
     sched = meta.get_schedule()
     sched["last_triggered_date"] = date.today().isoformat()
@@ -243,24 +187,8 @@ def _mark_triggered_today(account_id):
 # CLI
 # ---------------------------------------------------------------------------
 
-
 def _run_account(api, acc, pc_override=None, mobile_override=None, force=False):
-    """
-    Run a single account. Returns True if something executed.
-
-    Respects the per-account schedule unless overrides are supplied. Skips if
-    already triggered today unless `force=True`.
-
-    Args:
-        api: AutoRewarderAPI instance (must already be headless-configured)
-        acc: account dict from api.account_manager.list()
-        pc_override: if not None, ignore schedule and run this many PC queries
-        mobile_override: if not None, ignore schedule and run this many Mobile queries
-        force: if True, ignore "already triggered today" and run anyway
-
-    Returns:
-        bool: True if the account was run, False if skipped
-    """
+    """Run a single account. Returns True if something executed."""
     aid = acc["id"]
     label = acc["label"]
 
@@ -291,12 +219,12 @@ def _run_account(api, acc, pc_override=None, mobile_override=None, force=False):
         console_log(f"Skipping '{label}': both PC and Mobile counts are 0.")
         return False
 
-    # Make this the current account so api.main() targets it.
+    # (VPN runs inside api.main() — see _apply_vpn_for_current_account.)
+
     if api.account_manager.current_id() != aid:
         console_log(f"Switching to account '{label}'.")
         api.account_manager.select(aid)
         api._rebuild_account_context()
-        # Keep logger rebound after context rebuild.
         if api.history is not None:
             api.history._logger = console_log
         if api.daily_set is not None:
@@ -306,7 +234,6 @@ def _run_account(api, acc, pc_override=None, mobile_override=None, force=False):
         if api.stats is not None:
             api.stats._logger = console_log
 
-    # Mark triggered BEFORE the run so a crash doesn't produce a second run.
     if pc_override is None and mobile_override is None:
         _mark_triggered_today(aid)
 
@@ -314,9 +241,7 @@ def _run_account(api, acc, pc_override=None, mobile_override=None, force=False):
         pc_override is None and mobile_override is None
     ):
         _run_scheduled(
-            api,
-            pc,
-            mobile,
+            api, pc, mobile,
             sched.get("runDuration", 3),
             sched.get("queriesPerHour", 10),
         )
@@ -331,19 +256,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="AutoRewarder headless / scheduled runner (multi-account aware)"
     )
-    parser.add_argument(
-        "--account",
-        help="Run only this account (by id or label). Default: all enabled schedules.",
-    )
+    parser.add_argument("--account", help="Run only this account (by id or label).")
     parser.add_argument("--pc", type=int, help="Override PC queries for this run.")
-    parser.add_argument(
-        "--mobile", type=int, help="Override Mobile queries for this run."
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Run even if already triggered today.",
-    )
+    parser.add_argument("--mobile", type=int, help="Override Mobile queries for this run.")
+    parser.add_argument("--force", action="store_true",
+                        help="Run even if already triggered today.")
     args = parser.parse_args()
 
     if args.pc is not None and args.pc < 0:
@@ -363,17 +280,10 @@ def main():
         if acc is None:
             console_log(f"[ERROR] No account matches '{args.account}'.")
             return
-        _run_account(
-            api,
-            acc,
-            pc_override=args.pc,
-            mobile_override=args.mobile,
-            force=args.force,
-        )
+        _run_account(api, acc, pc_override=args.pc,
+                     mobile_override=args.mobile, force=args.force)
         return
 
-    # Default: iterate every enabled schedule. api._run_lock ensures only one
-    # run executes at a time inside the process.
     ran_any = False
     for acc in accounts:
         if _run_account(api, acc, force=args.force):
