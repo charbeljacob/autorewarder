@@ -1,16 +1,10 @@
-# 1. Detect the installed Edge version
-EDGE_VERSION=$(microsoft-edge --version | awk '{print $3}')
-echo "Detected Edge version: $EDGE_VERSION"
+cd ~/Desktop/autorewarder
 
-# 2. Download the matching driver from the new domain
-wget -O /tmp/edgedriver.zip "https://msedgedriver.microsoft.com/${EDGE_VERSION}/edgedriver_linux64.zip"
+# Connect to your target server first (ExpressVPN CLI already does this)
+expressvpnctl connect "australia-sydney-2"
 
-# 3. Extract and install the driver
-sudo apt install -y unzip  # Ensure unzip is available
-unzip -o /tmp/edgedriver.zip -d /tmp/msedgedriver/
-sudo mv /tmp/msedgedriver/msedgedriver /usr/local/bin/
-sudo chmod +x /usr/local/bin/msedgedriver
-rm -rf /tmp/edgedriver.zip /tmp/msedgedriver/
-
-# 4. Verify the installation
-msedgedriver --version
+# Ask the fixed parser what it sees
+.venv/bin/python -c "
+from src.vpn_manager import get_vpn_status
+print(get_vpn_status())
+"
