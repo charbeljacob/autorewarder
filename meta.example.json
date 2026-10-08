@@ -1,0 +1,7 @@
+{
+    "first_setup_done": true,
+    "vpn": {
+        "server": "usa-new-jersey-1",
+        "geo_locale": "US"
+    }
+}
