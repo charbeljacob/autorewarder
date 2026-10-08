@@ -145,12 +145,35 @@ def vpn_cli_available() -> bool:
 
 
 def get_vpn_status() -> dict:
-    out = vpn_cli("status")
-    low = out.lower()
-    if "connected to" in low:
-        return {"connected": True, "location": low.rsplit("connected to", 1)[-1].strip()}
-    return {"connected": False, "location": None}
+    """
+    Return {'connected': bool, 'location': Optional[str]}.
 
+    Newer versions of the ExpressVPN Linux app print extra info after the
+    "Connected to <server>" line, e.g.:
+
+        Connected to australia-sydney-2
+        protocol in use: lightwayudp
+        network lock: enabled when connected
+        split tunnel: disabled
+
+    We only want the server name from the first line. The old
+    `rsplit("connected to")` approach swallowed all the extra lines, which
+    caused `is_same_server()` to always fail and the account to be skipped.
+    """
+    out = vpn_cli("status")
+    if not out:
+        return {"connected": False, "location": None}
+
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        low = line.lower()
+        if "connected to" in low:
+            # Take the substring after the marker on this single line only.
+            server = line.split("connected to", 1)[1].strip()
+            if server:
+                return {"connected": True, "location": server}
+
+    return {"connected": False, "location": None}
 
 def is_same_server(current_location: Optional[str], target_server: str) -> bool:
     if not current_location or not target_server:
